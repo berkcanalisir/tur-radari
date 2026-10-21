@@ -31,6 +31,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -57,6 +58,8 @@ STEAMSPY = "https://steamspy.com/api.php"
 STORE_DETAILS = "https://store.steampowered.com/api/appdetails"
 STORE_REVIEWS = "https://store.steampowered.com/appreviews/{appid}"
 CURRENT_PLAYERS = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+STORE_SEARCH = "https://store.steampowered.com/search/results/"
+TAG_LIST = "https://store.steampowered.com/tagdata/populartags/english"
 YT_SEARCH = "https://www.googleapis.com/youtube/v3/search"
 YT_VIDEOS = "https://www.googleapis.com/youtube/v3/videos"
 
@@ -284,7 +287,8 @@ def score_all(games, weights=None):
 
 
 # ------------------------------------------------------------------- akış ---
-def collect(f, appids, spy_rows, args, yt_key, on_progress=None, top=None, stop_after_old=40):
+def collect(f, appids, spy_rows, args, yt_key, on_progress=None, top=None, stop_after_old=40,
+            rank_rows=None):
     """
     1) Ön eleme: sadece mağaza detayıyla tarih/fiyat/tür kontrolü (ucuz, önbellekli).
        Liste yeniden eskiye sıralıysa, art arda `stop_after_old` oyun pencereden
@@ -347,10 +351,12 @@ def collect(f, appids, spy_rows, args, yt_key, on_progress=None, top=None, stop_
         passed.append((appid, det, rel, age_days, price))
 
     # --- 2. aşama: pencere içindeki en başarılılar
+    rank_rows = rank_rows if rank_rows is not None else spy_rows
+
     def spy_reviews(appid):
-        r = spy_rows.get(str(appid)) or {}
+        r = rank_rows.get(str(appid)) or {}
         return r.get("positive", 0) + r.get("negative", 0)
-    if spy_rows:
+    if rank_rows:
         passed.sort(key=lambda x: spy_reviews(x[0]), reverse=True)
     if top and len(passed) > top:
         skipped["sıralama dışı (top sınırı)"] = len(passed) - top
@@ -398,14 +404,105 @@ def collect(f, appids, spy_rows, args, yt_key, on_progress=None, top=None, stop_
     return games, skipped, coverage
 
 
-def tag_candidates(f, tag, max_price, min_reviews, top, scan_factor=5):
-    """Etiketteki adaylar, yeniden eskiye (appid büyükten küçüğe ≈ çıkış tarihi)."""
+def steam_tag_id(f, tag):
+    """Etiket adını Steam'in sayısal etiket kimliğine çevirir."""
+    rows = f.get_json(TAG_LIST, delay=0.5) or []
+    for r in rows:
+        if r.get("name", "").strip().lower() == tag.strip().lower():
+            return r.get("tagid")
+    return None
+
+
+def _parse_search_html(html_text):
+    """Mağaza arama sonucundaki her oyun için appid, çıkış, yorum sayısı ve fiyat."""
+    out = []
+    for block in html_text.split('data-ds-appid="')[1:]:
+        raw_id = block.split('"', 1)[0]
+        if not raw_id.isdigit():          # paketler birden çok appid taşır, atla
+            continue
+        rel = re.search(r'search_released[^>]*>\s*([^<]*?)\s*<', block)
+        rv = re.search(r'of the ([\d,\.]+) user reviews', block)
+        price = re.search(r'data-price-final="(\d+)"', block)
+        out.append({
+            "appid": int(raw_id),
+            "cikis": parse_release(rel.group(1)) if rel and rel.group(1) else None,
+            "yorum": int(re.sub(r"[^\d]", "", rv.group(1))) if rv else 0,
+            "fiyat_kurus": int(price.group(1)) if price else None,
+        })
+    return out
+
+
+def steam_search_recent(f, tagid, max_age_months, min_reviews, max_price,
+                        max_pages=120, page_size=50):
+    """
+    Steam mağaza aramasından etiketteki oyunları yeniden eskiye çeker; pencerenin
+    dışına çıkınca durur. Yorum ve fiyatı arama sonucundan okuyarak ön eleme yapar.
+    """
+    today = dt.date.today()
+    cutoff = today - dt.timedelta(days=max_age_months * 30.44)
+    rows, oldest, seen, start, old_run = {}, None, 0, 0, 0
+    done = False
+    for _ in range(max_pages):
+        d = f.get_json(STORE_SEARCH, {
+            "infinite": 1, "tags": tagid, "category1": 998, "sort_by": "Released_DESC",
+            "start": start, "count": page_size, "cc": "us", "l": "english",
+        }, delay=1.5) or {}
+        items = _parse_search_html(d.get("results_html", ""))
+        if not items:
+            done = True
+            break
+        for it in items:
+            seen += 1
+            if it["cikis"]:
+                oldest = min(oldest, it["cikis"]) if oldest else it["cikis"]
+                if it["cikis"] < cutoff:
+                    old_run += 1
+                    continue
+                old_run = 0
+            if it["yorum"] < min_reviews:
+                continue
+            if it["fiyat_kurus"] is not None and it["fiyat_kurus"] / 100 > max_price:
+                continue
+            rows[str(it["appid"])] = {"appid": it["appid"], "positive": it["yorum"], "negative": 0}
+        start += len(items)
+        if old_run >= 15:                     # sıralı liste: pencere bitti
+            done = True
+            break
+        total = d.get("total_count")
+        if total is not None and start >= int(total):
+            done = True
+            break
+    info = {"kaynak": "Steam mağaza araması", "arama_taranan": seen,
+            "taranan_en_eski_cikis": oldest.isoformat() if oldest else None,
+            "pencere_tamamen_tarandi": done}
+    return rows, info
+
+
+def tag_candidates(f, tag, max_price, min_reviews, top, max_age_months=36, scan_factor=5):
+    """
+    Adayları döndürür: (steamspy_satırları, appid_listesi, sıralama_satırları, bilgi).
+    Önce Steam mağaza aramasını dener (güncel, tarihe göre sıralı); olmazsa SteamSpy.
+    """
+    try:
+        tagid = steam_tag_id(f, tag)
+        if tagid is None:
+            f.record_error("etiket", f"'{tag}' Steam etiket listesinde bulunamadı, SteamSpy'a "
+                           f"geçildi. Yazımı Steam'deki gibi mi?")
+        else:
+            rows, info = steam_search_recent(f, tagid, max_age_months, min_reviews, max_price)
+            info["etiket_id"] = tagid
+            appids = [r["appid"] for r in rows.values()]
+            return {}, appids, rows, info
+    except RuntimeError as e:
+        f.record_error("steam_arama", f"Mağaza araması başarısız, SteamSpy'a geçildi: {e}")
+
     spy_rows = steamspy_tag(f, tag) or {}
     cands = [r for r in spy_rows.values()
              if int(r.get("initialprice") or 0) / 100 <= max_price
              and (r.get("positive", 0) + r.get("negative", 0)) >= min_reviews]
     cands.sort(key=lambda r: int(r["appid"]), reverse=True)
-    return spy_rows, [int(r["appid"]) for r in cands[:top * scan_factor]]
+    info = {"kaynak": "SteamSpy (yedek)", "etiketteki_oyun": len(spy_rows)}
+    return spy_rows, [int(r["appid"]) for r in cands[:top * scan_factor]], spy_rows, info
 
 
 def write_outputs(games, skipped, args, label):
@@ -459,15 +556,19 @@ def main():
     spy_rows = {}
     if args.tag:
         print(f"SteamSpy: '{args.tag}' etiketi alınıyor...")
-        spy_rows, appids = tag_candidates(f, args.tag, args.max_price, args.min_reviews, args.top)
+        spy_rows, appids, rank_rows, info = tag_candidates(
+            f, args.tag, args.max_price, args.min_reviews, args.top, args.max_age_months)
         label = args.tag.replace(" ", "_")
-        print(f"Etikette {len(spy_rows)} oyun, yeniden eskiye {len(appids)} aday taranacak.")
+        print(f"Kaynak: {info.get('kaynak')}, {len(appids)} aday incelenecek.")
     else:
-        appids, label = args.appids, "liste"
+        appids, label, rank_rows, info = args.appids, "liste", None, {}
+        spy_rows = {}
 
     games, skipped, coverage = collect(f, appids, spy_rows, args, yt_key,
                                        top=args.top if args.tag else None,
-                                       stop_after_old=40 if args.tag else None)
+                                       stop_after_old=40 if spy_rows else None,
+                                       rank_rows=rank_rows)
+    coverage.update(info)
     print(f"Kapsam: {coverage}")
     if not games:
         print("Filtrelerden geçen oyun yok. Elenenler:", skipped)

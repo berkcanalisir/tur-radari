@@ -19,7 +19,7 @@ import streamlit as st
 
 import basari_skoru as bs
 
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 CACHE_DIR = "cache"
 
 st.set_page_config(page_title="Tür Radarı", page_icon="📡", layout="wide",
@@ -336,21 +336,23 @@ if run:
     st.session_state["settings"] = {"etiket": tag, **vars(args), "top": top}
     try:
         with st.status(f"{tag} analiz ediliyor", expanded=True) as status:
-            st.write("SteamSpy'dan etiket listesi alınıyor")
-            spy_rows, appids = bs.tag_candidates(F, tag, max_price, min_reviews, top)
+            st.write("Steam mağazasından etiketteki yeni oyunlar taranıyor")
+            spy_rows, appids, rank_rows, info = bs.tag_candidates(
+                F, tag, max_price, min_reviews, top, age[1])
             if not appids:
                 status.update(label="Bu etikette uygun oyun bulunamadı", state="error")
-                F.record_error("etiket", f"'{tag}' etiketi boş döndü veya filtrelerden oyun geçmedi "
-                               f"(SteamSpy satır sayısı: {len(spy_rows)})", severity="engelleyici")
+                F.record_error("etiket", f"'{tag}' etiketinde filtrelerden geçen oyun çıkmadı. "
+                               f"Tarama bilgisi: {info}", severity="engelleyici")
                 st.session_state.pop("games", None)
             else:
-                st.write(f"Etikette {tr_num(len(spy_rows))} oyun var. Yeniden eskiye en fazla "
-                         f"{len(appids)} aday taranacak, pencereye girenlerin en başarılı "
-                         f"{top} tanesi seçilecek.")
+                st.write(f"Kaynak: {info.get('kaynak')}. Pencerede {len(appids)} aday var, "
+                         f"en başarılı {top} tanesi incelenecek.")
                 bar = st.progress(0.0)
                 games, skipped, coverage = bs.collect(
-                    F, appids, spy_rows, args, YT_KEY, top=top,
+                    F, appids, spy_rows, args, YT_KEY, top=top, rank_rows=rank_rows,
+                    stop_after_old=40 if spy_rows else None,
                     on_progress=lambda ph, i, n, x: bar.progress(i / n, text=f"{ph}: {i}/{n}, {x}"))
+                coverage.update(info)
                 st.session_state["coverage"] = coverage
                 if not games and skipped.get("ağ hatası"):
                     F.record_error("analiz", f"İncelenen {len(appids)} oyunun hiçbirinden veri "
@@ -401,7 +403,8 @@ df = pd.DataFrame([{
 
 cov = st.session_state.get("coverage") or {}
 if cov and not cov.get("pencere_tamamen_tarandi"):
-    st.warning(f"Tarama sınırına ulaşıldı: {cov.get('taranan')} aday tarandı, en eskisi "
+    st.warning(f"Tarama sınırına ulaşıldı: {cov.get('arama_taranan') or cov.get('taranan')} "
+               f"oyun tarandı, en eskisi "
                f"{cov.get('taranan_en_eski_cikis')} tarihli. Seçtiğiniz pencerenin daha eski kısmı "
                f"incelenmedi; daha dar bir etiket seçin ya da oyun sayısını artırın.")
 
