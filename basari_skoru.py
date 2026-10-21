@@ -284,49 +284,86 @@ def score_all(games, weights=None):
 
 
 # ------------------------------------------------------------------- akış ---
-def collect(f, appids, spy_rows, args, yt_key, on_progress=None):
+def collect(f, appids, spy_rows, args, yt_key, on_progress=None, top=None, stop_after_old=40):
+    """
+    1) Ön eleme: sadece mağaza detayıyla tarih/fiyat/tür kontrolü (ucuz, önbellekli).
+       Liste yeniden eskiye sıralıysa, art arda `stop_after_old` oyun pencereden
+       eski çıkınca tarama durur.
+    2) Sıralama: pencereye giren oyunlar SteamSpy yorum sayısına göre sıralanır,
+       en başarılı `top` tanesi seçilir.
+    3) Ağır veri: yalnızca seçilenler için yorum, oyuncu ve sosyal veri çekilir.
+    """
     today = dt.date.today()
-    games, skipped = [], {}
+    games, skipped, passed = [], {}, []
+    oldest_seen, old_streak, scanned = None, 0, 0
 
     def skip(reason):
         skipped[reason] = skipped.get(reason, 0) + 1
 
-    for i, appid in enumerate(appids, 1):
+    def progress(phase, i, n, extra=""):
         if on_progress:
-            on_progress(i, len(appids), appid)
+            on_progress(phase, i, n, extra)
         else:
-            print(f"  [{i}/{len(appids)}] {appid}", end="\r", flush=True)
+            print(f"  {phase} [{i}/{n}] {extra}      ", end="\r", flush=True)
+
+    # --- 1. aşama: ön eleme
+    for i, appid in enumerate(appids, 1):
+        progress("Ön eleme", i, len(appids), f"{len(passed)} oyun pencerede")
+        scanned = i
         try:
             det = store_details(f, appid)
-            if not det or det.get("type") != "game":
-                skip("oyun değil / bulunamadı"); continue
-            if det.get("release_date", {}).get("coming_soon"):
-                skip("henüz çıkmadı"); continue
-            rel = parse_release(det.get("release_date", {}).get("date", ""))
-            if not rel:
-                skip("çıkış tarihi okunamadı"); continue
-            age_days = (today - rel).days
-            if age_days < args.min_age_days:
-                skip(f"{args.min_age_days} günden yeni"); continue
-            if age_days > args.max_age_months * 30.44:
-                skip(f"{args.max_age_months} aydan eski"); continue
+        except RuntimeError as e:
+            skip("ağ hatası")
+            f.record_error("oyun_verisi", e, appid=appid)
+            continue
+        if not det or det.get("type") != "game":
+            skip("oyun değil / bulunamadı"); continue
+        if det.get("release_date", {}).get("coming_soon"):
+            skip("henüz çıkmadı"); continue
+        rel = parse_release(det.get("release_date", {}).get("date", ""))
+        if not rel:
+            skip("çıkış tarihi okunamadı"); continue
+        oldest_seen = min(oldest_seen, rel) if oldest_seen else rel
+        age_days = (today - rel).days
+        if age_days > args.max_age_months * 30.44:
+            skip(f"{args.max_age_months} aydan eski")
+            old_streak += 1
+            if stop_after_old and old_streak >= stop_after_old:
+                break
+            continue
+        old_streak = 0
+        if age_days < args.min_age_days:
+            skip(f"{args.min_age_days} günden yeni"); continue
+        is_free = det.get("is_free", False)
+        po = det.get("price_overview") or {}
+        price = (po.get("initial") or po.get("final") or 0) / 100
+        if is_free and not args.include_free:
+            skip("ücretsiz"); continue
+        if price > args.max_price:
+            skip(f"{args.max_price}$ üstü"); continue
+        pubs = [x.lower() for x in det.get("publishers", [])]
+        if any(x.lower() in pubs for x in args.exclude_publisher):
+            skip("hariç tutulan yayıncı"); continue
+        passed.append((appid, det, rel, age_days, price))
 
-            is_free = det.get("is_free", False)
-            po = det.get("price_overview") or {}
-            price = (po.get("initial") or po.get("final") or 0) / 100
-            if is_free and not args.include_free:
-                skip("ücretsiz"); continue
-            if price > args.max_price:
-                skip(f"{args.max_price}$ üstü"); continue
-            pubs = [p.lower() for p in det.get("publishers", [])]
-            if any(x.lower() in pubs for x in args.exclude_publisher):
-                skip("hariç tutulan yayıncı"); continue
+    # --- 2. aşama: pencere içindeki en başarılılar
+    def spy_reviews(appid):
+        r = spy_rows.get(str(appid)) or {}
+        return r.get("positive", 0) + r.get("negative", 0)
+    if spy_rows:
+        passed.sort(key=lambda x: spy_reviews(x[0]), reverse=True)
+    if top and len(passed) > top:
+        skipped["sıralama dışı (top sınırı)"] = len(passed) - top
+        passed = passed[:top]
 
+    # --- 3. aşama: ağır veri
+    for j, (appid, det, rel, age_days, price) in enumerate(passed, 1):
+        progress("Veri toplama", j, len(passed), det.get("name", "")[:30])
+        try:
             rs = review_summary(f, appid)
             total = rs.get("total_reviews", 0)
             if total < args.min_reviews:
                 skip(f"{args.min_reviews} yorumdan az"); continue
-
             spy = spy_rows.get(str(appid)) or steamspy_app(f, appid)
             recent, capped = recent_review_count(f, appid)
             games.append({
@@ -350,19 +387,25 @@ def collect(f, appids, spy_rows, args, yt_key, on_progress=None):
         except RuntimeError as e:
             skip("ağ hatası")
             f.record_error("oyun_verisi", e, appid=appid)
-            print(f"\n  ! {appid}: {e}", file=sys.stderr)
     if not on_progress:
         print()
-    return games, skipped
+    coverage = {
+        "aday": len(appids), "taranan": scanned,
+        "taranan_en_eski_cikis": oldest_seen.isoformat() if oldest_seen else None,
+        "pencere_tamamen_tarandi": bool(
+            oldest_seen and (today - oldest_seen).days > args.max_age_months * 30.44),
+    }
+    return games, skipped, coverage
 
 
-def tag_candidates(f, tag, max_price, min_reviews, top):
+def tag_candidates(f, tag, max_price, min_reviews, top, scan_factor=5):
+    """Etiketteki adaylar, yeniden eskiye (appid büyükten küçüğe ≈ çıkış tarihi)."""
     spy_rows = steamspy_tag(f, tag) or {}
     cands = [r for r in spy_rows.values()
              if int(r.get("initialprice") or 0) / 100 <= max_price
              and (r.get("positive", 0) + r.get("negative", 0)) >= min_reviews]
-    cands.sort(key=lambda r: r.get("positive", 0) + r.get("negative", 0), reverse=True)
-    return spy_rows, [int(r["appid"]) for r in cands[:top]]
+    cands.sort(key=lambda r: int(r["appid"]), reverse=True)
+    return spy_rows, [int(r["appid"]) for r in cands[:top * scan_factor]]
 
 
 def write_outputs(games, skipped, args, label):
@@ -416,18 +459,16 @@ def main():
     spy_rows = {}
     if args.tag:
         print(f"SteamSpy: '{args.tag}' etiketi alınıyor...")
-        spy_rows = steamspy_tag(f, args.tag) or {}
-        cands = [r for r in spy_rows.values()
-                 if int(r.get("initialprice") or 0) / 100 <= args.max_price
-                 and (r.get("positive", 0) + r.get("negative", 0)) >= args.min_reviews]
-        cands.sort(key=lambda r: r.get("positive", 0) + r.get("negative", 0), reverse=True)
-        appids = [int(r["appid"]) for r in cands[:args.top]]
+        spy_rows, appids = tag_candidates(f, args.tag, args.max_price, args.min_reviews, args.top)
         label = args.tag.replace(" ", "_")
-        print(f"Etikette {len(spy_rows)} oyun, ön filtreden sonra {len(appids)} inceleniyor.")
+        print(f"Etikette {len(spy_rows)} oyun, yeniden eskiye {len(appids)} aday taranacak.")
     else:
         appids, label = args.appids, "liste"
 
-    games, skipped = collect(f, appids, spy_rows, args, yt_key)
+    games, skipped, coverage = collect(f, appids, spy_rows, args, yt_key,
+                                       top=args.top if args.tag else None,
+                                       stop_after_old=40 if args.tag else None)
+    print(f"Kapsam: {coverage}")
     if not games:
         print("Filtrelerden geçen oyun yok. Elenenler:", skipped)
         sys.exit(1)
